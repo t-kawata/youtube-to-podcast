@@ -658,7 +658,7 @@ for url in "${URLS[@]}"; do
     TOTAL_STEPS=$((TOTAL_STEPS + 1))
   else
     SKIP_URL+=("0")
-    local n_steps=4
+    n_steps=4
     if ((DO_TRANSCRIBE)); then
       n_steps=$((n_steps + 1))
     fi
