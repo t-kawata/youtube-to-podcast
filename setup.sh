@@ -329,26 +329,50 @@ pass "配置: $QWEN_DIR/longform_clone_tts.py"
 # ============================================================================
 # 11. 参照音声の配置
 # ============================================================================
-step "参照音声（reference.wav / reference.txt）の配置確認"
+step "参照音声（ref*.wav / ref*.txt）の配置確認"
 
-if [ -f "$Y2P_DIR/wavs/reference.wav" ] && [ ! -f "$QWEN_DIR/wavs/reference.wav" ]; then
-  cp -f "$Y2P_DIR/wavs/reference.wav" "$QWEN_DIR/wavs/reference.wav"
-  info "コピー: reference.wav"
-fi
-if [ -f "$Y2P_DIR/wavs/reference.txt" ] && [ ! -f "$QWEN_DIR/wavs/reference.txt" ]; then
-  cp -f "$Y2P_DIR/wavs/reference.txt" "$QWEN_DIR/wavs/reference.txt"
-  info "コピー: reference.txt"
-fi
+REF_IDS=()
+while IFS= read -r f; do
+  REF_IDS+=("$(basename "$f" .wav)")
+done < <(find "$Y2P_DIR/wavs" -maxdepth 1 -type f -name 'ref*.wav' | sort)
 
-if [ ! -s "$QWEN_DIR/wavs/reference.wav" ] || [ ! -s "$QWEN_DIR/wavs/reference.txt" ]; then
+[ "${#REF_IDS[@]}" -gt 0 ] || die \
+  "$Y2P_DIR/wavs に ref*.wav が1つもありません。" \
+  "本人または明示的に許諾された話者の5〜30秒程度の単独話者音声を
+       wavs/refNN.wav (24kHz/mono/PCM16) として、その発話内容全文を wavs/refNN.txt として
+       リポジトリに置いてから、./setup.sh を再実行してください。"
+info "検出: ${#REF_IDS[@]} 組 (${REF_IDS[*]})"
+
+for id in "${REF_IDS[@]}"; do
+  for ext in wav txt; do
+    if [ -f "$Y2P_DIR/wavs/$id.$ext" ] && [ ! -f "$QWEN_DIR/wavs/$id.$ext" ]; then
+      cp -f "$Y2P_DIR/wavs/$id.$ext" "$QWEN_DIR/wavs/$id.$ext" || die \
+        "$id.$ext のコピーに失敗しました。" "$QWEN_DIR/wavs への書き込み権限を確認してください。"
+      info "コピー: $id.$ext"
+    fi
+  done
+  if [ ! -s "$QWEN_DIR/wavs/$id.wav" ] || [ ! -s "$QWEN_DIR/wavs/$id.txt" ]; then
+    die \
+      "参照音声 ($QWEN_DIR/wavs/$id.wav) または文字起こし ($QWEN_DIR/wavs/$id.txt) が未配置、または空です。" \
+      "$id.wav と $id.txt は対で、リポジトリの wavs/ に置いてから ./setup.sh を再実行してください。"
+  fi
+done
+
+if [ ! -f "$Y2P_DIR/wavs/background.wav" ]; then
   die \
-    "参照音声 ($QWEN_DIR/wavs/reference.wav) または文字起こし ($QWEN_DIR/wavs/reference.txt) が未配置です。" \
-    "本人または明示的に許諾された話者の5〜30秒程度の単独話者音声を
-       $QWEN_DIR/wavs/reference.wav (24kHz/mono/PCM16) として、
-       その発話内容全文を $QWEN_DIR/wavs/reference.txt として配置してから、
-       ./setup.sh を再実行してください。"
+    "$Y2P_DIR/wavs/background.wav が存在しません。" \
+    "background.wav をリポジトリの wavs/ に置いてから ./setup.sh を再実行してください。"
 fi
-pass "参照音声・文字起こしの存在確認"
+if [ ! -f "$QWEN_DIR/wavs/background.wav" ]; then
+  cp -f "$Y2P_DIR/wavs/background.wav" "$QWEN_DIR/wavs/background.wav" || die \
+    "background.wav のコピーに失敗しました。" "$QWEN_DIR/wavs への書き込み権限を確認してください。"
+  info "コピー: background.wav"
+fi
+[ -s "$QWEN_DIR/wavs/background.wav" ] || die \
+  "$QWEN_DIR/wavs/background.wav が空、または存在しません。" \
+  "$QWEN_DIR/wavs/background.wav を削除して ./setup.sh を再実行してください。"
+
+pass "参照音声・文字起こし ${#REF_IDS[@]} 組と background.wav の存在確認"
 
 # ============================================================================
 # 12. DeepFilterNet3
@@ -429,7 +453,7 @@ pass "df/io.py パッチ確認"
 step "DeepFilterNet 実動作確認"
 
 DF_TEST_OUT="$(mktemp -d)"
-DF_TEST_IN="$QWEN_DIR/wavs/reference.wav"
+DF_TEST_IN="$QWEN_DIR/wavs/${REF_IDS[0]}.wav"
 "$DF_TOOL_DIR/bin/deepFilter" \
   --model-base-dir DeepFilterNet3 \
   --output-dir "$DF_TEST_OUT" \
@@ -439,9 +463,9 @@ df_status=$?
 DF_TEST_RESULT="$DF_TEST_OUT/$(basename "$DF_TEST_IN")"
 rm -rf "$DF_TEST_OUT"
 [ "$df_status" -eq 0 ] || die \
-  "deepFilter の実行に失敗しました（reference.wavでのテスト）。" \
+  "deepFilter の実行に失敗しました（${REF_IDS[0]}.wav でのテスト）。" \
   "上記トラブルシューティングを一通り再確認してください。初回実行時はモデルのダウンロードで時間がかかる場合があります。"
-pass "deepFilter 実動作確認（reference.wavでデノイズ成功）"
+pass "deepFilter 実動作確認（${REF_IDS[0]}.wav でデノイズ成功）"
 
 # ============================================================================
 # 13. 最終疎通確認

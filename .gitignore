@@ -1,1 +1,4 @@
 **/.DS_Store
+
+# 大きい BGM 音源は各自ローカルに配置する（setup.sh 参照）
+wavs/background.wav

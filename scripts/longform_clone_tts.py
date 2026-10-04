@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -16,6 +18,9 @@ DEFAULT_MODEL = ROOT / "models" / "Qwen3-TTS-12Hz-1.7B-Base-8bit"
 WAVS_DIR = ROOT / "wavs"
 DEFAULT_REFERENCE_TEXT = WAVS_DIR / "reference.txt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
+DEFAULT_BGM = WAVS_DIR / "background.wav"
+
+FMT = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono"
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,7 +28,9 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Qwen3-TTS long-form Japanese voice cloning. Generates one WAV per "
             "sentence in a temporary directory, joins them with natural pauses, "
-            "writes one final WAV, then removes temporary files."
+            "optionally mixes background music (wavs/background.wav) with "
+            "loudness normalization, writes one final WAV, then removes "
+            "temporary files."
         )
     )
     parser.add_argument(
@@ -74,7 +81,42 @@ def parse_args() -> argparse.Namespace:
         "--gain",
         type=float,
         default=1.0,
-        help="Linear gain multiplier applied to the final WAV (default: 1.0, e.g. 1.5)",
+        help=(
+            "Linear gain multiplier applied to the final WAV (default: 1.0, e.g. 1.5). "
+            "Ignored when BGM is mixed (output is loudness-normalized instead)."
+        ),
+    )
+    parser.add_argument(
+        "--bgm",
+        type=Path,
+        default=DEFAULT_BGM,
+        help="Background music WAV (default: wavs/background.wav; skipped if the default is missing)",
+    )
+    parser.add_argument(
+        "--no-bgm",
+        action="store_true",
+        help="Skip BGM mixing and output the voice only",
+    )
+    parser.add_argument("--voice-lufs", type=float, default=-16.0)
+    parser.add_argument(
+        "--bgm-offset-db",
+        type=float,
+        default=18.0,
+        help="BGM is this many dB below the voice (default: 18)",
+    )
+    parser.add_argument("--true-peak", type=float, default=-1.5)
+    parser.add_argument("--lra", type=float, default=11.0)
+    parser.add_argument(
+        "--bgm-tail",
+        type=float,
+        default=5.0,
+        help="Seconds the BGM continues after the voice ends (default: 5)",
+    )
+    parser.add_argument(
+        "--bgm-fade",
+        type=float,
+        default=3.0,
+        help="BGM fade-out length in seconds (default: 3)",
     )
     parser.add_argument("--temperature", type=float, default=0.55)
     parser.add_argument("--top-p", type=float, default=0.82)
@@ -110,7 +152,11 @@ def resolve_reference(
         fail(f"Reference directory not found: {WAVS_DIR}")
 
     candidates = sorted(
-        p for p in WAVS_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".wav"
+        p
+        for p in WAVS_DIR.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".wav"
+        and p.name != DEFAULT_BGM.name
     )
     if text_arg is None:
         candidates = [p for p in candidates if p.with_suffix(".txt").is_file()]
@@ -195,6 +241,74 @@ def write_manifest(temp_dir: Path, jobs: list[tuple[str, int]]) -> None:
     (temp_dir / "manifest.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _run(cmd: list[str]) -> str:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        fail(f"Command failed: {' '.join(cmd[:3])} ...\n{p.stderr[-1500:]}")
+    return p.stderr + p.stdout
+
+
+def _loudnorm(path: Path, target: float, tp: float, lra: float) -> str:
+    """Pass 1: measure. Returns the pass-2 (linear) loudnorm filter string."""
+    err = _run([
+        "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+        "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
+        "-f", "null", "-",
+    ])
+    m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
+    if m["input_i"] in ("-inf", "inf"):
+        fail(f"Cannot measure loudness (silent input?): {path}")
+    return (
+        f"loudnorm=I={target}:TP={tp}:LRA={lra}:linear=true"
+        f":measured_I={m['input_i']}:measured_TP={m['input_tp']}"
+        f":measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}"
+        f":offset={m['target_offset']}"
+    )
+
+
+def mix_bgm(
+    voice: Path,
+    bgm: Path,
+    out: Path,
+    work: Path,
+    *,
+    voice_lufs: float,
+    bg_offset: float,
+    tp: float,
+    lra: float,
+    tail: float,
+    fade: float,
+) -> None:
+    """Normalize voice and BGM, mix (BGM loops, continues `tail` s after the
+    voice and fades out), then normalize the mix. Output: 16 kHz mono 16-bit."""
+    dur = float(_run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(voice),
+    ]).strip())
+    total = dur + tail
+    fade_st = max(total - fade, 0.0)
+
+    vf = _loudnorm(voice, voice_lufs, tp, lra)
+    bf = _loudnorm(bgm, voice_lufs - bg_offset, tp, lra)
+    pre = work / "pre_mix.wav"
+    _run([
+        "ffmpeg", "-y", "-v", "error", "-i", str(voice), "-i", str(bgm),
+        "-filter_complex",
+        f"[0:a]{FMT},{vf},aresample=16000,apad=pad_dur={tail}[v];"
+        f"[1:a]{FMT},{bf},aresample=16000,aloop=loop=-1:size=2147483647,"
+        f"atrim=0:{total:.6f},afade=t=out:st={fade_st:.6f}:d={fade}[b];"
+        f"[v][b]amix=inputs=2:duration=longest:normalize=0,atrim=0:{total:.6f},"
+        f"aformat=sample_fmts=s16:channel_layouts=mono[m]",
+        "-map", "[m]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(pre),
+    ])
+    ff = _loudnorm(pre, voice_lufs, tp, lra)
+    _run([
+        "ffmpeg", "-y", "-v", "error", "-i", str(pre),
+        "-af", f"{ff},{FMT}",
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out),
+    ])
+
+
 def main() -> None:
     args = parse_args()
     input_path = args.input_text.expanduser().resolve()
@@ -216,6 +330,21 @@ def main() -> None:
         fail("Pause durations must be non-negative.")
     if args.gain <= 0:
         fail("Gain must be positive.")
+
+    bgm_path: Path | None = None
+    if not args.no_bgm:
+        candidate = args.bgm.expanduser().resolve()
+        if candidate.is_file():
+            bgm_path = candidate
+        elif args.bgm != DEFAULT_BGM:
+            fail(f"BGM not found: {candidate}")
+        else:
+            print(f"Note: {candidate} not found; BGM mixing skipped.", file=sys.stderr)
+    if bgm_path is not None:
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            fail("ffmpeg/ffprobe not found in PATH.")
+        if args.gain != 1.0:
+            print("Note: --gain is ignored when BGM is mixed.", file=sys.stderr)
 
     source_text = normalize_text(input_path.read_text(encoding="utf-8"))
     reference_text = normalize_text(reference_text_path.read_text(encoding="utf-8"))
@@ -249,6 +378,7 @@ def main() -> None:
     print(f"Temporary directory: {temp_dir}")
     print(f"Output: {output_path}")
     print(f"Gain: {args.gain}")
+    print(f"BGM: {bgm_path if bgm_path else 'none'}")
     write_manifest(temp_dir, jobs)
 
     try:
@@ -302,17 +432,36 @@ def main() -> None:
             fail("No final audio was produced.")
 
         merged = np.concatenate(final_parts).astype(np.float32)
-        peak = float(np.max(np.abs(merged)))
-        scaled_peak = peak * args.gain
-        if scaled_peak > 1.0:
-            print(
-                f"Warning: peak {peak:.3f} x {args.gain} = {scaled_peak:.3f} "
-                f"exceeds 1.0; clipping",
-                file=sys.stderr,
-            )
-        merged = np.clip(merged * args.gain, -1.0, 1.0)
 
-        sf.write(output_path, merged, sample_rate, subtype="PCM_16")
+        if bgm_path is not None:
+            voice_wav = temp_dir / "voice.wav"
+            sf.write(voice_wav, np.clip(merged, -1.0, 1.0), sample_rate, subtype="PCM_16")
+            print("Mixing BGM and normalizing loudness...", flush=True)
+            mix_bgm(
+                voice_wav,
+                bgm_path,
+                output_path,
+                temp_dir,
+                voice_lufs=args.voice_lufs,
+                bg_offset=args.bgm_offset_db,
+                tp=args.true_peak,
+                lra=args.lra,
+                tail=args.bgm_tail,
+                fade=args.bgm_fade,
+            )
+            sample_rate = 16000
+        else:
+            peak = float(np.max(np.abs(merged)))
+            scaled_peak = peak * args.gain
+            if scaled_peak > 1.0:
+                print(
+                    f"Warning: peak {peak:.3f} x {args.gain} = {scaled_peak:.3f} "
+                    f"exceeds 1.0; clipping",
+                    file=sys.stderr,
+                )
+            merged = np.clip(merged * args.gain, -1.0, 1.0)
+            sf.write(output_path, merged, sample_rate, subtype="PCM_16")
+
         print(
             f"Completed: {output_path} "
             f"({sample_rate} Hz, {len(jobs)} sentence files generated)",
