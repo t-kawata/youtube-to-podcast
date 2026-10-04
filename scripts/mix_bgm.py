@@ -111,7 +111,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     ap.add_argument("-p", "--podcast", type=Path, required=True, help="Podcast (voice) WAV")
-    ap.add_argument("-b", "--bgm", type=Path, required=True, help="Background music WAV")
+    ap.add_argument("-b", "--bgm", type=Path, required=True,
+                    help="Background music file (any ffmpeg-readable format, e.g. WAV/Opus)")
     ap.add_argument("-o", "--output", type=Path, default=None,
                     help="Output WAV (default: <podcast-stem>_bgm.wav next to the podcast)")
     ap.add_argument("--voice-lufs", type=float, default=-16.0)

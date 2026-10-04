@@ -19,7 +19,7 @@ DEFAULT_MODEL = ROOT / "models" / "Qwen3-TTS-12Hz-1.7B-Base-8bit"
 WAVS_DIR = ROOT / "wavs"
 DEFAULT_REFERENCE_TEXT = WAVS_DIR / "reference.txt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
-DEFAULT_BGM = WAVS_DIR / "background.wav"
+DEFAULT_BGM = WAVS_DIR / "background.opus"
 
 FMT = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono"
 
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Qwen3-TTS long-form Japanese voice cloning. Generates one WAV per "
             "sentence in a temporary directory, joins them with natural pauses, "
-            "optionally mixes background music (wavs/background.wav) with "
+            "optionally mixes background music (wavs/background.opus) with "
             "loudness normalization, writes one final WAV, then removes "
             "temporary files."
         )
@@ -91,7 +91,10 @@ def parse_args() -> argparse.Namespace:
         "--bgm",
         type=Path,
         default=DEFAULT_BGM,
-        help="Background music WAV (default: wavs/background.wav; skipped if the default is missing)",
+        help=(
+            "Background music file, any ffmpeg-readable format "
+            "(default: wavs/background.opus; skipped if the default is missing)"
+        ),
     )
     parser.add_argument(
         "--no-bgm",

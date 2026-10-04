@@ -1,4 +1,7 @@
 **/.DS_Store
 
-# 大きい BGM 音源は各自ローカルに配置する（setup.sh 参照）
+# 原音 WAV (323MB) は追跡しない。配布用は wavs/background.opus を追跡する
 wavs/background.wav
+
+# Python バイトコードキャッシュ
+__pycache__/

@@ -358,21 +358,21 @@ for id in "${REF_IDS[@]}"; do
   fi
 done
 
-if [ ! -f "$Y2P_DIR/wavs/background.wav" ]; then
+if [ ! -f "$Y2P_DIR/wavs/background.opus" ]; then
   die \
-    "$Y2P_DIR/wavs/background.wav が存在しません。" \
-    "background.wav をリポジトリの wavs/ に置いてから ./setup.sh を再実行してください。"
+    "$Y2P_DIR/wavs/background.opus が存在しません。" \
+    "リポジトリの wavs/background.opus が欠落しています。git の状態を確認してください。"
 fi
-if [ ! -f "$QWEN_DIR/wavs/background.wav" ]; then
-  cp -f "$Y2P_DIR/wavs/background.wav" "$QWEN_DIR/wavs/background.wav" || die \
-    "background.wav のコピーに失敗しました。" "$QWEN_DIR/wavs への書き込み権限を確認してください。"
-  info "コピー: background.wav"
+if [ ! -f "$QWEN_DIR/wavs/background.opus" ]; then
+  cp -f "$Y2P_DIR/wavs/background.opus" "$QWEN_DIR/wavs/background.opus" || die \
+    "background.opus のコピーに失敗しました。" "$QWEN_DIR/wavs への書き込み権限を確認してください。"
+  info "コピー: background.opus"
 fi
-[ -s "$QWEN_DIR/wavs/background.wav" ] || die \
-  "$QWEN_DIR/wavs/background.wav が空、または存在しません。" \
-  "$QWEN_DIR/wavs/background.wav を削除して ./setup.sh を再実行してください。"
+[ -s "$QWEN_DIR/wavs/background.opus" ] || die \
+  "$QWEN_DIR/wavs/background.opus が空、または存在しません。" \
+  "$QWEN_DIR/wavs/background.opus を削除して ./setup.sh を再実行してください。"
 
-pass "参照音声・文字起こし ${#REF_IDS[@]} 組と background.wav の存在確認"
+pass "参照音声・文字起こし ${#REF_IDS[@]} 組と background.opus の存在確認"
 
 # ============================================================================
 # 12. DeepFilterNet3
