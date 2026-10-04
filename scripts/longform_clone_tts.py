@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import random
 import re
 import shutil
 import sys
@@ -12,8 +13,8 @@ from mlx_audio.tts.utils import load_model
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROOT / "models" / "Qwen3-TTS-12Hz-1.7B-Base-8bit"
-DEFAULT_REFERENCE_AUDIO = ROOT / "wavs" / "reference.wav"
-DEFAULT_REFERENCE_TEXT = ROOT / "wavs" / "reference.txt"
+WAVS_DIR = ROOT / "wavs"
+DEFAULT_REFERENCE_TEXT = WAVS_DIR / "reference.txt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 
 
@@ -37,20 +38,43 @@ def parse_args() -> argparse.Namespace:
         help="Final WAV path. Default: outputs/<input-stem>.wav",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--reference-audio", type=Path, default=DEFAULT_REFERENCE_AUDIO)
-    parser.add_argument("--reference-text", type=Path, default=DEFAULT_REFERENCE_TEXT)
+    parser.add_argument(
+        "--reference-audio",
+        type=Path,
+        default=None,
+        help=(
+            "Reference voice WAV. Default: pick one .wav at random from wavs/ "
+            "(only those with a same-name .txt transcript, unless --reference-text is given)"
+        ),
+    )
+    parser.add_argument(
+        "--reference-text",
+        type=Path,
+        default=None,
+        help=(
+            "Reference transcript. Default: <reference-audio-stem>.txt next to the "
+            "reference audio (falls back to wavs/reference.txt if --reference-audio "
+            "is given and no same-name .txt exists)"
+        ),
+    )
     parser.add_argument("--language", default="Japanese")
     parser.add_argument(
         "--pause-ms",
         type=int,
-        default=360,
-        help="Pause after normal sentence endings (default: 360)",
+        default=850,
+        help="Pause after normal sentence endings (default: 850)",
     )
     parser.add_argument(
         "--paragraph-pause-ms",
         type=int,
         default=720,
         help="Pause between paragraphs (default: 720)",
+    )
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=1.0,
+        help="Linear gain multiplier applied to the final WAV (default: 1.0, e.g. 1.5)",
     )
     parser.add_argument("--temperature", type=float, default=0.55)
     parser.add_argument("--top-p", type=float, default=0.82)
@@ -67,6 +91,44 @@ def parse_args() -> argparse.Namespace:
 
 def fail(message: str) -> None:
     raise SystemExit(message)
+
+
+def resolve_reference(
+    audio_arg: Path | None, text_arg: Path | None
+) -> tuple[Path, Path, bool]:
+    """Return (reference_audio, reference_text_path, randomly_selected)."""
+    if audio_arg is not None:
+        audio = audio_arg.expanduser().resolve()
+        if text_arg is not None:
+            text = text_arg.expanduser().resolve()
+        else:
+            sibling = audio.with_suffix(".txt")
+            text = sibling if sibling.exists() else DEFAULT_REFERENCE_TEXT.resolve()
+        return audio, text, False
+
+    if not WAVS_DIR.is_dir():
+        fail(f"Reference directory not found: {WAVS_DIR}")
+
+    candidates = sorted(
+        p for p in WAVS_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".wav"
+    )
+    if text_arg is None:
+        candidates = [p for p in candidates if p.with_suffix(".txt").is_file()]
+    if not candidates:
+        if text_arg is None:
+            fail(
+                f"No .wav with a same-name .txt transcript found in: {WAVS_DIR} "
+                f"(or pass --reference-text)"
+            )
+        fail(f"No .wav files found in: {WAVS_DIR}")
+
+    audio = random.choice(candidates).resolve()
+    text = (
+        text_arg.expanduser().resolve()
+        if text_arg is not None
+        else audio.with_suffix(".txt")
+    )
+    return audio, text, True
 
 
 def normalize_text(text: str) -> str:
@@ -137,8 +199,9 @@ def main() -> None:
     args = parse_args()
     input_path = args.input_text.expanduser().resolve()
     model_path = args.model.expanduser().resolve()
-    reference_audio = args.reference_audio.expanduser().resolve()
-    reference_text_path = args.reference_text.expanduser().resolve()
+    reference_audio, reference_text_path, randomly_selected = resolve_reference(
+        args.reference_audio, args.reference_text
+    )
 
     for path, label in (
         (input_path, "Input text"),
@@ -151,6 +214,8 @@ def main() -> None:
 
     if args.pause_ms < 0 or args.paragraph_pause_ms < 0:
         fail("Pause durations must be non-negative.")
+    if args.gain <= 0:
+        fail("Gain must be positive.")
 
     source_text = normalize_text(input_path.read_text(encoding="utf-8"))
     reference_text = normalize_text(reference_text_path.read_text(encoding="utf-8"))
@@ -176,8 +241,14 @@ def main() -> None:
 
     print(f"Input: {input_path}")
     print(f"Sentences: {len(jobs)}")
+    print(
+        f"Reference audio: {reference_audio}"
+        f"{' (randomly selected)' if randomly_selected else ''}"
+    )
+    print(f"Reference transcript: {reference_text_path}")
     print(f"Temporary directory: {temp_dir}")
     print(f"Output: {output_path}")
+    print(f"Gain: {args.gain}")
     write_manifest(temp_dir, jobs)
 
     try:
@@ -230,7 +301,17 @@ def main() -> None:
         if sample_rate is None or not final_parts:
             fail("No final audio was produced.")
 
-        merged = np.concatenate(final_parts)
+        merged = np.concatenate(final_parts).astype(np.float32)
+        peak = float(np.max(np.abs(merged)))
+        scaled_peak = peak * args.gain
+        if scaled_peak > 1.0:
+            print(
+                f"Warning: peak {peak:.3f} x {args.gain} = {scaled_peak:.3f} "
+                f"exceeds 1.0; clipping",
+                file=sys.stderr,
+            )
+        merged = np.clip(merged * args.gain, -1.0, 1.0)
+
         sf.write(output_path, merged, sample_rate, subtype="PCM_16")
         print(
             f"Completed: {output_path} "
