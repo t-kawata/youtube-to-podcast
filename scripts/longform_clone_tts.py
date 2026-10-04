@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -101,8 +102,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bgm-offset-db",
         type=float,
-        default=18.0,
-        help="BGM is this many dB below the voice (default: 18)",
+        default=22.0,
+        help="BGM is this many dB below the voice (default: 22)",
     )
     parser.add_argument("--true-peak", type=float, default=-1.5)
     parser.add_argument("--lra", type=float, default=11.0)
@@ -241,6 +242,11 @@ def write_manifest(temp_dir: Path, jobs: list[tuple[str, int]]) -> None:
     (temp_dir / "manifest.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _fmt_t(sec: float) -> str:
+    sec = max(int(sec), 0)
+    return f"{sec // 60:02d}:{sec % 60:02d}"
+
+
 def _run(cmd: list[str]) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -248,22 +254,80 @@ def _run(cmd: list[str]) -> str:
     return p.stderr + p.stdout
 
 
-def _loudnorm(path: Path, target: float, tp: float, lra: float) -> str:
+def _run_ffmpeg(cmd_args: list[str], total_sec: float, label: str) -> str:
+    """Run ffmpeg with live progress (percent, elapsed, ETA). Returns stderr."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-progress", "pipe:1", *cmd_args]
+    tty = sys.stderr.isatty()
+    start = time.monotonic()
+    last_pct = -10
+    with tempfile.TemporaryFile("w+") as errf:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1
+        )
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                key, _, val = line.strip().partition("=")
+                if key != "out_time_us" or not val.lstrip("-").isdigit():
+                    continue
+                done = max(int(val) / 1_000_000, 0.0)
+                frac = min(done / total_sec, 1.0) if total_sec > 0 else 0.0
+                pct = int(frac * 100)
+                elapsed = time.monotonic() - start
+                eta = elapsed * (1 - frac) / frac if frac > 0.01 else 0.0
+                msg = (f"  {label}: {pct:3d}%  {_fmt_t(done)}/{_fmt_t(total_sec)}"
+                       f"  elapsed {_fmt_t(elapsed)}  ETA {_fmt_t(eta)}")
+                if tty:
+                    print("\r" + msg + "   ", end="", file=sys.stderr, flush=True)
+                elif pct - last_pct >= 10:
+                    last_pct = pct
+                    print(msg, file=sys.stderr, flush=True)
+            rc = proc.wait()
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        errf.seek(0)
+        err = errf.read()
+    if tty:
+        print(file=sys.stderr)
+    if rc != 0:
+        fail(f"ffmpeg failed ({label}):\n{err[-1500:]}")
+    print(f"  {label}: done in {_fmt_t(time.monotonic() - start)}",
+          file=sys.stderr, flush=True)
+    return err
+
+
+def _loudnorm(path: Path, target: float, tp: float, lra: float,
+              total_sec: float, label: str) -> str:
     """Pass 1: measure. Returns the pass-2 (linear) loudnorm filter string."""
-    err = _run([
-        "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+    err = _run_ffmpeg([
+        "-i", str(path),
         "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
         "-f", "null", "-",
-    ])
+    ], total_sec, label)
     m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
     if m["input_i"] in ("-inf", "inf"):
         fail(f"Cannot measure loudness (silent input?): {path}")
+    print(f"  measured: I={m['input_i']} LUFS, TP={m['input_tp']} dB, "
+          f"LRA={m['input_lra']} LU", file=sys.stderr, flush=True)
     return (
         f"loudnorm=I={target}:TP={tp}:LRA={lra}:linear=true"
         f":measured_I={m['input_i']}:measured_TP={m['input_tp']}"
         f":measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}"
         f":offset={m['target_offset']}"
     )
+
+
+def _duration(path: Path) -> float:
+    return float(_run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(path),
+    ]).strip())
+
+
+def _stage(n: int, text: str) -> None:
+    print(f"[BGM {n}/6] {text}", file=sys.stderr, flush=True)
 
 
 def mix_bgm(
@@ -281,18 +345,22 @@ def mix_bgm(
 ) -> None:
     """Normalize voice and BGM, mix (BGM loops, continues `tail` s after the
     voice and fades out), then normalize the mix. Output: 16 kHz mono 16-bit."""
-    dur = float(_run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "csv=p=0", str(voice),
-    ]).strip())
-    total = dur + tail
+    voice_dur = _duration(voice)
+    bgm_dur = _duration(bgm)
+    total = voice_dur + tail
     fade_st = max(total - fade, 0.0)
+    print(f"Voice {voice_dur:.1f}s, BGM {bgm_dur:.1f}s -> output {total:.1f}s, "
+          f"fade-out starts at {fade_st:.1f}s", file=sys.stderr, flush=True)
 
-    vf = _loudnorm(voice, voice_lufs, tp, lra)
-    bf = _loudnorm(bgm, voice_lufs - bg_offset, tp, lra)
+    _stage(1, "Measuring voice loudness")
+    vf = _loudnorm(voice, voice_lufs, tp, lra, voice_dur, "voice")
+    _stage(2, "Measuring BGM loudness")
+    bf = _loudnorm(bgm, voice_lufs - bg_offset, tp, lra, bgm_dur, "bgm")
+
     pre = work / "pre_mix.wav"
-    _run([
-        "ffmpeg", "-y", "-v", "error", "-i", str(voice), "-i", str(bgm),
+    _stage(3, "Mixing voice + BGM")
+    _run_ffmpeg([
+        "-y", "-v", "error", "-i", str(voice), "-i", str(bgm),
         "-filter_complex",
         f"[0:a]{FMT},{vf},aresample=16000,apad=pad_dur={tail}[v];"
         f"[1:a]{FMT},{bf},aresample=16000,aloop=loop=-1:size=2147483647,"
@@ -300,13 +368,16 @@ def mix_bgm(
         f"[v][b]amix=inputs=2:duration=longest:normalize=0,atrim=0:{total:.6f},"
         f"aformat=sample_fmts=s16:channel_layouts=mono[m]",
         "-map", "[m]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(pre),
-    ])
-    ff = _loudnorm(pre, voice_lufs, tp, lra)
-    _run([
-        "ffmpeg", "-y", "-v", "error", "-i", str(pre),
+    ], total, "mix")
+    _stage(4, "Measuring mix loudness")
+    ff = _loudnorm(pre, voice_lufs, tp, lra, total, "mix")
+    _stage(5, "Normalizing final output")
+    _run_ffmpeg([
+        "-y", "-v", "error", "-i", str(pre),
         "-af", f"{ff},{FMT}",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out),
-    ])
+    ], total, "final")
+    _stage(6, "Done")
 
 
 def main() -> None:
