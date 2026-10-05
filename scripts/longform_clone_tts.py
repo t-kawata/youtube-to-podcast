@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -20,6 +21,7 @@ WAVS_DIR = ROOT / "wavs"
 DEFAULT_REFERENCE_TEXT = WAVS_DIR / "reference.txt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_BGM = WAVS_DIR / "background.opus"
+CACHE_DIR = ROOT / ".cache_bgm"
 
 FMT = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono"
 
@@ -302,16 +304,31 @@ def _run_ffmpeg(cmd_args: list[str], total_sec: float, label: str) -> str:
 
 
 def _loudnorm(path: Path, target: float, tp: float, lra: float,
-              total_sec: float, label: str) -> str:
-    """Pass 1: measure. Returns the pass-2 (linear) loudnorm filter string."""
-    err = _run_ffmpeg([
-        "-i", str(path),
-        "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
-        "-f", "null", "-",
-    ], total_sec, label)
-    m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
-    if m["input_i"] in ("-inf", "inf"):
-        fail(f"Cannot measure loudness (silent input?): {path}")
+              total_sec: float, label: str, cache_dir: Path | None = None) -> str:
+    """Pass 1: measure (cached by file path/size/mtime + targets). Returns pass-2 filter."""
+    cache_file: Path | None = None
+    m = None
+    if cache_dir is not None:
+        st = path.stat()
+        key = hashlib.sha1(
+            f"{path}|{st.st_size}|{st.st_mtime_ns}|{target}|{tp}|{lra}|{FMT}".encode()
+        ).hexdigest()[:16]
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{key}.json"
+        if cache_file.is_file():
+            m = json.loads(cache_file.read_text())
+            print(f"  {label}: using cached measurement", file=sys.stderr, flush=True)
+    if m is None:
+        err = _run_ffmpeg([
+            "-i", str(path),
+            "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
+            "-f", "null", "-",
+        ], total_sec, label)
+        m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
+        if m["input_i"] in ("-inf", "inf"):
+            fail(f"Cannot measure loudness (silent input?): {path}")
+        if cache_file is not None:
+            cache_file.write_text(json.dumps(m))
     print(f"  measured: I={m['input_i']} LUFS, TP={m['input_tp']} dB, "
           f"LRA={m['input_lra']} LU", file=sys.stderr, flush=True)
     return (
@@ -346,8 +363,8 @@ def mix_bgm(
     tail: float,
     fade: float,
 ) -> None:
-    """Normalize voice and BGM, mix (BGM loops, continues `tail` s after the
-    voice and fades out), then normalize the mix. Output: 16 kHz mono 16-bit."""
+    """Normalize voice and BGM, mix (BGM loops if shorter, continues `tail` s after
+    the voice and fades out), then normalize the mix. Output: 16 kHz mono 16-bit."""
     voice_dur = _duration(voice)
     bgm_dur = _duration(bgm)
     total = voice_dur + tail
@@ -357,16 +374,19 @@ def mix_bgm(
 
     _stage(1, "Measuring voice loudness")
     vf = _loudnorm(voice, voice_lufs, tp, lra, voice_dur, "voice")
-    _stage(2, "Measuring BGM loudness")
-    bf = _loudnorm(bgm, voice_lufs - bg_offset, tp, lra, bgm_dur, "bgm")
+    _stage(2, "Measuring BGM loudness (cached)")
+    bf = _loudnorm(bgm, voice_lufs - bg_offset, tp, lra, bgm_dur, "bgm",
+                   cache_dir=CACHE_DIR)
 
+    loop = "" if bgm_dur >= total else "aloop=loop=-1:size=2147483647,"
     pre = work / "pre_mix.wav"
     _stage(3, "Mixing voice + BGM")
     _run_ffmpeg([
-        "-y", "-v", "error", "-i", str(voice), "-i", str(bgm),
+        "-y", "-v", "error", "-i", str(voice),
+        "-t", f"{total:.6f}", "-i", str(bgm),
         "-filter_complex",
         f"[0:a]{FMT},{vf},aresample=16000,apad=pad_dur={tail}[v];"
-        f"[1:a]{FMT},{bf},aresample=16000,aloop=loop=-1:size=2147483647,"
+        f"[1:a]{FMT},{bf},aresample=16000,{loop}"
         f"atrim=0:{total:.6f},afade=t=out:st={fade_st:.6f}:d={fade}[b];"
         f"[v][b]amix=inputs=2:duration=longest:normalize=0,atrim=0:{total:.6f},"
         f"aformat=sample_fmts=s16:channel_layouts=mono[m]",

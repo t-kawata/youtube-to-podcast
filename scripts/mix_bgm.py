@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 
 FMT = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono"
 STAGES = 6
+CACHE_DIR = Path(__file__).resolve().parent / ".cache_bgm"
 
 
 def fail(message: str) -> None:
@@ -29,7 +31,7 @@ def run(cmd: list[str]) -> str:
 
 
 def run_ffmpeg(args: list[str], total_sec: float, label: str) -> str:
-    """Run ffmpeg with live progress (percent, speed, elapsed, ETA). Returns stderr."""
+    """Run ffmpeg with live progress (percent, elapsed, ETA). Returns stderr."""
     cmd = ["ffmpeg", "-hide_banner", "-nostats", "-progress", "pipe:1", *args]
     tty = sys.stderr.isatty()
     start = time.monotonic()
@@ -72,15 +74,31 @@ def run_ffmpeg(args: list[str], total_sec: float, label: str) -> str:
 
 
 def loudnorm_filter(path: Path, target: float, tp: float, lra: float,
-                    total_sec: float, label: str) -> str:
-    err = run_ffmpeg([
-        "-i", str(path),
-        "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
-        "-f", "null", "-",
-    ], total_sec, label)
-    m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
-    if m["input_i"] in ("-inf", "inf"):
-        fail(f"Cannot measure loudness (silent input?): {path}")
+                    total_sec: float, label: str, cache_dir: Path | None = None) -> str:
+    """Pass 1: measure (cached by file path/size/mtime + targets). Returns pass-2 filter."""
+    cache_file: Path | None = None
+    m = None
+    if cache_dir is not None:
+        st = path.stat()
+        key = hashlib.sha1(
+            f"{path}|{st.st_size}|{st.st_mtime_ns}|{target}|{tp}|{lra}|{FMT}".encode()
+        ).hexdigest()[:16]
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{key}.json"
+        if cache_file.is_file():
+            m = json.loads(cache_file.read_text())
+            print(f"  {label}: using cached measurement", file=sys.stderr, flush=True)
+    if m is None:
+        err = run_ffmpeg([
+            "-i", str(path),
+            "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
+            "-f", "null", "-",
+        ], total_sec, label)
+        m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
+        if m["input_i"] in ("-inf", "inf"):
+            fail(f"Cannot measure loudness (silent input?): {path}")
+        if cache_file is not None:
+            cache_file.write_text(json.dumps(m))
     print(f"  measured: I={m['input_i']} LUFS, TP={m['input_tp']} dB, LRA={m['input_lra']} LU",
           file=sys.stderr, flush=True)
     return (
@@ -117,7 +135,7 @@ def parse_args() -> argparse.Namespace:
                     help="Output WAV (default: <podcast-stem>_bgm.wav next to the podcast)")
     ap.add_argument("--voice-lufs", type=float, default=-16.0)
     ap.add_argument("--bgm-offset-db", type=float, default=22.0,
-                    help="BGM is this many dB below the voice (default: 18)")
+                    help="BGM is this many dB below the voice (default: 22)")
     ap.add_argument("--true-peak", type=float, default=-1.5)
     ap.add_argument("--lra", type=float, default=11.0)
     ap.add_argument("--tail", type=float, default=5.0,
@@ -155,17 +173,20 @@ def main() -> None:
 
     stage(1, "Measuring podcast loudness")
     vf = loudnorm_filter(voice, a.voice_lufs, a.true_peak, a.lra, voice_dur, "podcast")
-    stage(2, "Measuring BGM loudness")
-    bf = loudnorm_filter(bgm, a.voice_lufs - a.bgm_offset_db, a.true_peak, a.lra, bgm_dur, "bgm")
+    stage(2, "Measuring BGM loudness (cached)")
+    bf = loudnorm_filter(bgm, a.voice_lufs - a.bgm_offset_db, a.true_peak, a.lra,
+                         bgm_dur, "bgm", cache_dir=CACHE_DIR)
 
+    loop = "" if bgm_dur >= total else "aloop=loop=-1:size=2147483647,"
     pre = out.with_name(f".{out.stem}.pre.wav")
     try:
         stage(3, "Mixing podcast + BGM")
         run_ffmpeg([
-            "-y", "-v", "error", "-i", str(voice), "-i", str(bgm),
+            "-y", "-v", "error", "-i", str(voice),
+            "-t", f"{total:.6f}", "-i", str(bgm),
             "-filter_complex",
             f"[0:a]{FMT},{vf},aresample=16000,apad=pad_dur={a.tail}[v];"
-            f"[1:a]{FMT},{bf},aresample=16000,aloop=loop=-1:size=2147483647,"
+            f"[1:a]{FMT},{bf},aresample=16000,{loop}"
             f"atrim=0:{total:.6f},afade=t=out:st={fade_st:.6f}:d={a.fade}[b];"
             f"[v][b]amix=inputs=2:duration=longest:normalize=0,"
             f"atrim=0:{total:.6f},aformat=sample_fmts=s16:channel_layouts=mono[m]",
