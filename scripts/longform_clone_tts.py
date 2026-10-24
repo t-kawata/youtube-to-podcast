@@ -22,6 +22,7 @@ DEFAULT_REFERENCE_TEXT = WAVS_DIR / "reference.txt"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_BGM = WAVS_DIR / "background.opus"
 CACHE_DIR = ROOT / ".cache_bgm"
+REPLACES_PATH = ROOT / "replaces.json"
 
 FMT = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono"
 
@@ -29,11 +30,12 @@ FMT = "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Qwen3-TTS long-form Japanese voice cloning. Generates one WAV per "
-            "sentence in a temporary directory, joins them with natural pauses, "
-            "optionally mixes background music (wavs/background.opus) with "
-            "loudness normalization, writes one final WAV, then removes "
-            "temporary files."
+            "Qwen3-TTS long-form Japanese voice cloning. Optionally applies "
+            "replaces.json to the input text once before normalization and "
+            "sentence splitting. Generates one WAV per sentence in a temporary "
+            "directory, joins them with natural pauses, optionally mixes "
+            "background music (wavs/background.opus) with loudness normalization, "
+            "writes one final WAV, then removes temporary files."
         )
     )
     parser.add_argument(
@@ -139,6 +141,51 @@ def parse_args() -> argparse.Namespace:
 
 def fail(message: str) -> None:
     raise SystemExit(message)
+
+
+def apply_replacements(text: str) -> str:
+    """Apply optional replaces.json once, without cascading replacements."""
+    try:
+        raw = REPLACES_PATH.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return text
+    except (OSError, UnicodeError) as exc:
+        fail(f"Cannot read replacements file: {REPLACES_PATH}\n{exc}")
+
+    try:
+        replacements = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"Invalid JSON in replacements file: {REPLACES_PATH}\n{exc}")
+
+    if not isinstance(replacements, dict):
+        fail(f"Replacements file must contain a JSON object: {REPLACES_PATH}")
+
+    for key, value in replacements.items():
+        if not isinstance(key, str) or not key:
+            fail(
+                f"Replacement keys must be non-empty strings: {REPLACES_PATH}"
+            )
+        if not isinstance(value, str):
+            fail(
+                f"Replacement value for {key!r} must be a string: "
+                f"{REPLACES_PATH}"
+            )
+
+    if not replacements:
+        return text
+
+    keys = sorted(replacements, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(key) for key in keys))
+    replaced, count = pattern.subn(
+        lambda match: replacements[match.group(0)],
+        text,
+    )
+    print(
+        f"Replacements: {REPLACES_PATH} "
+        f"({len(replacements)} rules, {count} matches)",
+        flush=True,
+    )
+    return replaced
 
 
 def resolve_reference(
@@ -280,8 +327,10 @@ def _run_ffmpeg(cmd_args: list[str], total_sec: float, label: str) -> str:
                 pct = int(frac * 100)
                 elapsed = time.monotonic() - start
                 eta = elapsed * (1 - frac) / frac if frac > 0.01 else 0.0
-                msg = (f"  {label}: {pct:3d}%  {_fmt_t(done)}/{_fmt_t(total_sec)}"
-                       f"  elapsed {_fmt_t(elapsed)}  ETA {_fmt_t(eta)}")
+                msg = (
+                    f"  {label}: {pct:3d}%  {_fmt_t(done)}/{_fmt_t(total_sec)}"
+                    f"  elapsed {_fmt_t(elapsed)}  ETA {_fmt_t(eta)}"
+                )
                 if tty:
                     print("\r" + msg + "   ", end="", file=sys.stderr, flush=True)
                 elif pct - last_pct >= 10:
@@ -298,13 +347,23 @@ def _run_ffmpeg(cmd_args: list[str], total_sec: float, label: str) -> str:
         print(file=sys.stderr)
     if rc != 0:
         fail(f"ffmpeg failed ({label}):\n{err[-1500:]}")
-    print(f"  {label}: done in {_fmt_t(time.monotonic() - start)}",
-          file=sys.stderr, flush=True)
+    print(
+        f"  {label}: done in {_fmt_t(time.monotonic() - start)}",
+        file=sys.stderr,
+        flush=True,
+    )
     return err
 
 
-def _loudnorm(path: Path, target: float, tp: float, lra: float,
-              total_sec: float, label: str, cache_dir: Path | None = None) -> str:
+def _loudnorm(
+    path: Path,
+    target: float,
+    tp: float,
+    lra: float,
+    total_sec: float,
+    label: str,
+    cache_dir: Path | None = None,
+) -> str:
     """Pass 1: measure (cached by file path/size/mtime + targets). Returns pass-2 filter."""
     cache_file: Path | None = None
     m = None
@@ -319,18 +378,26 @@ def _loudnorm(path: Path, target: float, tp: float, lra: float,
             m = json.loads(cache_file.read_text())
             print(f"  {label}: using cached measurement", file=sys.stderr, flush=True)
     if m is None:
-        err = _run_ffmpeg([
-            "-i", str(path),
-            "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
-            "-f", "null", "-",
-        ], total_sec, label)
+        err = _run_ffmpeg(
+            [
+                "-i", str(path),
+                "-af", f"{FMT},loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json",
+                "-f", "null", "-",
+            ],
+            total_sec,
+            label,
+        )
         m = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
         if m["input_i"] in ("-inf", "inf"):
             fail(f"Cannot measure loudness (silent input?): {path}")
         if cache_file is not None:
             cache_file.write_text(json.dumps(m))
-    print(f"  measured: I={m['input_i']} LUFS, TP={m['input_tp']} dB, "
-          f"LRA={m['input_lra']} LU", file=sys.stderr, flush=True)
+    print(
+        f"  measured: I={m['input_i']} LUFS, TP={m['input_tp']} dB, "
+        f"LRA={m['input_lra']} LU",
+        file=sys.stderr,
+        flush=True,
+    )
     return (
         f"loudnorm=I={target}:TP={tp}:LRA={lra}:linear=true"
         f":measured_I={m['input_i']}:measured_TP={m['input_tp']}"
@@ -340,10 +407,14 @@ def _loudnorm(path: Path, target: float, tp: float, lra: float,
 
 
 def _duration(path: Path) -> float:
-    return float(_run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "csv=p=0", str(path),
-    ]).strip())
+    return float(
+        _run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(path),
+            ]
+        ).strip()
+    )
 
 
 def _stage(n: int, text: str) -> None:
@@ -369,37 +440,56 @@ def mix_bgm(
     bgm_dur = _duration(bgm)
     total = voice_dur + tail
     fade_st = max(total - fade, 0.0)
-    print(f"Voice {voice_dur:.1f}s, BGM {bgm_dur:.1f}s -> output {total:.1f}s, "
-          f"fade-out starts at {fade_st:.1f}s", file=sys.stderr, flush=True)
+    print(
+        f"Voice {voice_dur:.1f}s, BGM {bgm_dur:.1f}s -> output {total:.1f}s, "
+        f"fade-out starts at {fade_st:.1f}s",
+        file=sys.stderr,
+        flush=True,
+    )
 
     _stage(1, "Measuring voice loudness")
     vf = _loudnorm(voice, voice_lufs, tp, lra, voice_dur, "voice")
     _stage(2, "Measuring BGM loudness (cached)")
-    bf = _loudnorm(bgm, voice_lufs - bg_offset, tp, lra, bgm_dur, "bgm",
-                   cache_dir=CACHE_DIR)
+    bf = _loudnorm(
+        bgm,
+        voice_lufs - bg_offset,
+        tp,
+        lra,
+        bgm_dur,
+        "bgm",
+        cache_dir=CACHE_DIR,
+    )
 
     loop = "" if bgm_dur >= total else "aloop=loop=-1:size=2147483647,"
     pre = work / "pre_mix.wav"
     _stage(3, "Mixing voice + BGM")
-    _run_ffmpeg([
-        "-y", "-v", "error", "-i", str(voice),
-        "-t", f"{total:.6f}", "-i", str(bgm),
-        "-filter_complex",
-        f"[0:a]{FMT},{vf},aresample=16000,apad=pad_dur={tail}[v];"
-        f"[1:a]{FMT},{bf},aresample=16000,{loop}"
-        f"atrim=0:{total:.6f},afade=t=out:st={fade_st:.6f}:d={fade}[b];"
-        f"[v][b]amix=inputs=2:duration=longest:normalize=0,atrim=0:{total:.6f},"
-        f"aformat=sample_fmts=s16:channel_layouts=mono[m]",
-        "-map", "[m]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(pre),
-    ], total, "mix")
+    _run_ffmpeg(
+        [
+            "-y", "-v", "error", "-i", str(voice),
+            "-t", f"{total:.6f}", "-i", str(bgm),
+            "-filter_complex",
+            f"[0:a]{FMT},{vf},aresample=16000,apad=pad_dur={tail}[v];"
+            f"[1:a]{FMT},{bf},aresample=16000,{loop}"
+            f"atrim=0:{total:.6f},afade=t=out:st={fade_st:.6f}:d={fade}[b];"
+            f"[v][b]amix=inputs=2:duration=longest:normalize=0,atrim=0:{total:.6f},"
+            f"aformat=sample_fmts=s16:channel_layouts=mono[m]",
+            "-map", "[m]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(pre),
+        ],
+        total,
+        "mix",
+    )
     _stage(4, "Measuring mix loudness")
     ff = _loudnorm(pre, voice_lufs, tp, lra, total, "mix")
     _stage(5, "Normalizing final output")
-    _run_ffmpeg([
-        "-y", "-v", "error", "-i", str(pre),
-        "-af", f"{ff},{FMT}",
-        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out),
-    ], total, "final")
+    _run_ffmpeg(
+        [
+            "-y", "-v", "error", "-i", str(pre),
+            "-af", f"{ff},{FMT}",
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out),
+        ],
+        total,
+        "final",
+    )
     _stage(6, "Done")
 
 
@@ -440,7 +530,10 @@ def main() -> None:
         if args.gain != 1.0:
             print("Note: --gain is ignored when BGM is mixed.", file=sys.stderr)
 
-    source_text = normalize_text(input_path.read_text(encoding="utf-8"))
+    source_text = input_path.read_text(encoding="utf-8")
+    source_text = apply_replacements(source_text)
+    source_text = normalize_text(source_text)
+
     reference_text = normalize_text(reference_text_path.read_text(encoding="utf-8"))
     if not source_text:
         fail(f"Input text is empty: {input_path}")
